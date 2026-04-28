@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { BasePromptElementProps, PromptElement, PromptElementProps, PromptSizing } from '@vscode/prompt-tsx';
+import { BasePromptElementProps, PromptElement, PromptElementProps } from '@vscode/prompt-tsx';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
 import { IVSCodeExtensionContext } from '../../../platform/extContext/common/extensionContext';
 import { IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
@@ -12,7 +12,7 @@ import { IExperimentationService } from '../../../platform/telemetry/common/null
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
 import { URI } from '../../../util/vs/base/common/uri';
 import { Tag } from '../../prompts/node/base/tag';
-import { IAgentMemoryService, normalizeCitations, RepoMemoryEntry } from '../common/agentMemoryService';
+import { IAgentMemoryService } from '../common/agentMemoryService';
 import { ToolName } from '../common/toolNames';
 import { extractSessionId } from './memoryTool';
 
@@ -40,22 +40,26 @@ export class MemoryContextPrompt extends PromptElement<MemoryContextPromptProps>
 		const enableCopilotMemory = this.configurationService.getExperimentBasedConfig(ConfigKey.CopilotMemoryEnabled, this.experimentationService);
 		const enableMemoryTool = this.configurationService.getExperimentBasedConfig(ConfigKey.MemoryToolEnabled, this.experimentationService);
 
-		const userMemoryContent = enableMemoryTool ? await this.getUserMemoryContent() : undefined;
-		const sessionMemoryFiles = enableMemoryTool ? await this.getSessionMemoryFiles(this.props.sessionResource) : undefined;
-		const repoMemories = enableCopilotMemory ? await this.agentMemoryService.getRepoMemories() : undefined;
-		const localRepoMemoryFiles = (enableMemoryTool && !enableCopilotMemory) ? await this.getLocalRepoMemoryFiles() : undefined;
-
 		if (!enableMemoryTool && !enableCopilotMemory) {
 			return null;
 		}
+
+		const userMemoryContent = enableMemoryTool ? await this.getUserMemoryContent() : undefined;
+		const sessionMemoryFiles = enableMemoryTool ? await this.getSessionMemoryFiles(this.props.sessionResource) : undefined;
+		const localRepoMemoryFiles = enableMemoryTool ? await this.getLocalRepoMemoryFiles() : undefined;
+
+		// When CAPI memory is enabled, read from the cache primed by AgentMemoryToolRegistrar
+		const sessionId = this.props.sessionResource ? extractSessionId(this.props.sessionResource) : undefined;
+		const promptResponse = enableCopilotMemory ? this.agentMemoryService.getCachedMemoryPrompt(sessionId) : undefined;
+		const memoryPromptText = promptResponse?.memoriesContext.prompt;
 
 		this._sendContextReadTelemetry(
 			!!userMemoryContent,
 			userMemoryContent?.length ?? 0,
 			sessionMemoryFiles?.length ?? 0,
 			sessionMemoryFiles?.join('\n').length ?? 0,
-			repoMemories?.length ?? 0,
-			repoMemories ? this.formatMemories(repoMemories).length : 0,
+			promptResponse?.memoriesContext.memoriesCount ?? 0,
+			memoryPromptText?.length ?? 0,
 		);
 
 		return (
@@ -64,7 +68,9 @@ export class MemoryContextPrompt extends PromptElement<MemoryContextPromptProps>
 					<Tag name='userMemory'>
 						{userMemoryContent
 							? <>The following are your persistent user memory notes. These persist across all workspaces and conversations.<br /><br />{userMemoryContent}</>
-							: <>No user preferences or notes saved yet. Use the {ToolName.Memory} tool to store persistent notes under /memories/.</>
+							: enableCopilotMemory
+						? <>No user preferences or notes saved yet. Use the `{ToolName.StoreMemory}` tool with `scope: 'user'` to save personal preferences.</>
+						: <>No user preferences or notes saved yet. Use the {ToolName.Memory} tool to store persistent notes under /memories/.</>
 						}
 					</Tag>
 				)}
@@ -76,7 +82,7 @@ export class MemoryContextPrompt extends PromptElement<MemoryContextPromptProps>
 						}
 					</Tag>
 				)}
-				{enableMemoryTool && !enableCopilotMemory && (
+				{enableMemoryTool && (
 					<Tag name='repoMemory'>
 						{localRepoMemoryFiles && localRepoMemoryFiles.length > 0
 							? <>The following files exist in your repository memory (/memories/repo/). These are scoped to the current workspace. Use the {ToolName.Memory} tool to read them if needed.<br /><br />{localRepoMemoryFiles.join('\n')}</>
@@ -84,16 +90,9 @@ export class MemoryContextPrompt extends PromptElement<MemoryContextPromptProps>
 						}
 					</Tag>
 				)}
-				{repoMemories && repoMemories.length > 0 && (
-					<Tag name='repository_memories'>
-						The following are recent memories stored for this repository from previous agent interactions. These memories may contain useful context about the codebase conventions, patterns, and practices. However, be aware that memories might be obsolete or incorrect or may not apply to your current task. Use the citations provided to verify the accuracy of any relevant memory before relying on it.<br />
-						<br />
-						{this.formatMemories(repoMemories)}
-						<br />
-						Be sure to consider these stored facts carefully. Consider whether any are relevant to your current task. If they are, verify their current applicability before using them to inform your work.<br />
-						<br />
-						If you come across a memory that you're able to verify and that you find useful, you should use the {ToolName.Memory} tool to store the same fact again. Only recent memories are retained, so storing the fact again will cause it to be retained longer.<br />
-						If you come across a fact that's incorrect or outdated, you should use the {ToolName.Memory} tool to store a new fact that reflects the current reality.<br />
+				{memoryPromptText && (
+					<Tag name='memory_context'>
+						{memoryPromptText}
 					</Tag>
 				)}
 			</>
@@ -197,27 +196,6 @@ export class MemoryContextPrompt extends PromptElement<MemoryContextPromptProps>
 		return files.length > 0 ? files : undefined;
 	}
 
-	private formatMemories(memories: RepoMemoryEntry[]): string {
-		return memories.map(m => {
-			const lines = [`**${m.subject}**`, `- Fact: ${m.fact}`];
-
-			// Format citations (handle both string and string[] formats)
-			if (m.citations) {
-				const citationsArray = normalizeCitations(m.citations) ?? [];
-				if (citationsArray.length > 0) {
-					lines.push(`- Citations: ${citationsArray.join(', ')}`);
-				}
-			}
-
-			// Include reason if present (from CAPI format)
-			if (m.reason) {
-				lines.push(`- Reason: ${m.reason}`);
-			}
-
-			return lines.join('\n');
-		}).join('\n\n');
-	}
-
 	private _sendContextReadTelemetry(hasUserMemory: boolean, userMemoryLength: number, sessionFileCount: number, sessionMemoryLength: number, repoMemoryCount: number, repoMemoryLength: number): void {
 		/* __GDPR__
 			"memoryContextRead" : {
@@ -247,21 +225,31 @@ export class MemoryContextPrompt extends PromptElement<MemoryContextPromptProps>
  * Prompt component that provides comprehensive instructions for using the memory tool.
  * Covers all three memory tiers: user, session, and repository.
  */
-export class MemoryInstructionsPrompt extends PromptElement<BasePromptElementProps> {
+export interface MemoryInstructionsPromptProps extends BasePromptElementProps {
+	readonly sessionResource?: string;
+}
+
+export class MemoryInstructionsPrompt extends PromptElement<MemoryInstructionsPromptProps> {
 	constructor(
-		props: PromptElementProps<BasePromptElementProps>,
+		props: PromptElementProps<MemoryInstructionsPromptProps>,
+		@IAgentMemoryService private readonly agentMemoryService: IAgentMemoryService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@IExperimentationService private readonly experimentationService: IExperimentationService,
 	) {
 		super(props);
 	}
 
-	async render(state: void, sizing: PromptSizing) {
+	async render() {
 		const enableCopilotMemory = this.configurationService.getExperimentBasedConfig(ConfigKey.CopilotMemoryEnabled, this.experimentationService);
 		const enableMemoryTool = this.configurationService.getExperimentBasedConfig(ConfigKey.MemoryToolEnabled, this.experimentationService);
 		if (!enableCopilotMemory && !enableMemoryTool) {
 			return null;
 		}
+
+		const sessionId = this.props.sessionResource ? extractSessionId(this.props.sessionResource) : undefined;
+		const storeInstructionsPrompt = enableCopilotMemory
+			? this.agentMemoryService.getCachedMemoryPrompt(sessionId)?.storeInstructions?.prompt
+			: undefined;
 
 		return <Tag name='memoryInstructions'>
 			As you work, consult your memory files to build on previous experience. When you encounter a mistake that seems like it could be common, check your memory for relevant notes — and if nothing is written yet, record what you learned.<br />
@@ -270,7 +258,8 @@ export class MemoryInstructionsPrompt extends PromptElement<BasePromptElementPro
 				Memory is organized into the scopes defined below:<br />
 				{enableMemoryTool && <>- **User memory** (`/memories/`): Persistent notes that survive across all workspaces and conversations. Store user preferences, common patterns, frequently used commands, and general insights here. First {MAX_USER_MEMORY_LINES} lines are loaded into your context automatically.<br /></>}
 				{enableMemoryTool && <>- **Session memory** (`/memories/session/`): Notes for the current conversation only. Store task-specific context, in-progress notes, and temporary working state here. Session files are listed in your context but not loaded automatically — use the memory tool to read them when needed.<br /></>}
-				{enableCopilotMemory && <>- **Repository memory** (`/memories/repo/`): Repository-scoped facts stored via Copilot. Only the `create` command is supported. Store codebase conventions, build commands, project structure facts, and verified practices here.<br /></>}
+				{enableCopilotMemory && enableMemoryTool && <>- **Repository memory** (`/memories/repo/`): Repository-scoped facts stored via Copilot Memory. Use the `{ToolName.Memory}` tool to view any existing local repo memory files. Only the `create` command is supported for writing new facts. Store codebase conventions, build commands, project structure facts, and verified practices here.<br /></>}
+				{enableCopilotMemory && !enableMemoryTool && <>- **Repository memory** (`/memories/repo/`): Repository-scoped facts stored via Copilot Memory. Only the `create` command is supported. Store codebase conventions, build commands, project structure facts, and verified practices here.<br /></>}
 				{enableMemoryTool && !enableCopilotMemory && <>- **Repository memory** (`/memories/repo/`): Repository-scoped facts stored locally in the workspace. Store codebase conventions, build commands, project structure facts, and verified practices here.<br /></>}
 			</Tag>
 			<br />
@@ -285,38 +274,23 @@ export class MemoryInstructionsPrompt extends PromptElement<BasePromptElementPro
 					Guidelines for session memory (`/memories/session/`):<br />
 					- Use session memory to keep plans up to date and reviewing historical summaries.<br />
 					- Do not create unnecessary session memory files. You should only view and update existing session files.<br />
+					{!enableCopilotMemory && <>Guidelines for repository memory (`/memories/repo/`):<br />
+					- Use the `create` command to store codebase facts. File content should be a JSON object with fields: `subject`, `fact`, `citations`, `reason`.<br />
+					- Only `create` is supported — use `view` to read existing entries.<br />
+					- Store facts that are unlikely to change and will help with future tasks across this repository.<br />
+					</>}
+					{enableCopilotMemory && <>Guidelines for local repository memory (`/memories/repo/`):<br />
+					- Use the `{ToolName.Memory}` tool to `view`, `str_replace`, `delete`, or `rename` existing local repo memory files.<br />
+					- New repository facts should be stored via Copilot Memory (see instructions below) rather than creating new local files.<br />
+					</>}
 				</Tag>
 			</>}
 			<br />
-			{enableCopilotMemory && <>
-				<Tag name='repoMemoryInstructions'>
-					If you come across an important fact about the codebase that could help in future code review or generation tasks, beyond the current task, use the {ToolName.Memory} tool to store it. Use the `create` command with a path under `/memories/repo/` to store repository-scoped facts. The file content should be a JSON object with these fields: `subject`, `fact`, `citations`, `reason`, and `category`.<br />
-					Facts may be gleaned from the codebase itself or learned from user input or feedback. Such facts might include:<br />
-					- Conventions, preferences, or best practices specific to this codebase that might be overlooked when inspecting only a limited code sample<br />
-					- Important information about the structure or logic of the codebase<br />
-					- Commands for linting, building, or running tests that have been verified through a successful run<br />
-					<Tag name='examples'>
-						- "Use ErrKind wrapper for every public API error"<br />
-						- "Prefer ExpectNoLog helper over silent nil checks in tests"<br />
-						- "Always use Python typing"<br />
-						- "Follow the Google JavaScript Style Guide"<br />
-						- "Use html_escape as a sanitizer to avoid cross site scripting vulnerabilities"<br />
-						- "The code can be built with `npm run build` and tested with `npm run test`"<br />
-					</Tag>
-					Only store facts that meet the following criteria:<br />
-					<Tag name='factsCriteria'>
-						- Are likely to have actionable implications for a future task<br />
-						- Are independent of changes you are making as part of your current task, and will remain relevant if your current code isn't merged<br />
-						- Are unlikely to change over time<br />
-						- Cannot always be inferred from a limited code sample<br />
-						- Contain no secrets or sensitive data<br />
-					</Tag>
-					Always include the reason and citations fields.<br />
-					Before storing, ask yourself: Will this help with future coding or code review tasks across the repository? If unsure, skip storing it.<br />
-					Note: Only `create` is supported for `/memories/repo/` paths.<br />
-					If the user asks how to view or manage their repo memories refer them to https://docs.github.com/en/copilot/how-tos/use-copilot-agents/copilot-memory.<br />
+			{storeInstructionsPrompt && (
+				<Tag name='storeMemoryInstructions'>
+					{storeInstructionsPrompt}
 				</Tag>
-			</>}
+			)}
 		</Tag>;
 	}
 }
