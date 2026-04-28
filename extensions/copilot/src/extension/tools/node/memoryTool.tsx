@@ -15,7 +15,8 @@ import { ITelemetryService } from '../../../platform/telemetry/common/telemetry'
 import { CancellationToken } from '../../../util/vs/base/common/cancellation';
 import { URI } from '../../../util/vs/base/common/uri';
 import { LanguageModelTextPart, LanguageModelToolResult, MarkdownString } from '../../../vscodeTypes';
-import { IAgentMemoryService, RepoMemoryEntry } from '../common/agentMemoryService';
+import type { StoreMemoryRequest } from '@github/copilot-agentic-tools/memory';
+import { IAgentMemoryService } from '../common/agentMemoryService';
 import { IMemoryCleanupService } from '../common/memoryCleanupService';
 import { ToolName } from '../common/toolNames';
 import { ICopilotTool, ToolRegistry } from '../common/toolsRegistry';
@@ -272,7 +273,7 @@ export class MemoryTool implements ICopilotTool<MemoryToolParams> {
 
 		// Route /memories/repo/* to CAPI if enabled, otherwise local storage
 		if (isRepoPath(path)) {
-			const capiEnabled = await this.agentMemoryService.checkMemoryEnabled();
+			const capiEnabled = this.configurationService.getExperimentBasedConfig(ConfigKey.CopilotMemoryEnabled, this.experimentationService);
 			if (capiEnabled) {
 				const result = await this._dispatchRepoCAPI(params, path);
 				this._sendRepoTelemetry(params.command, result.outcome, requestId, model);
@@ -289,6 +290,15 @@ export class MemoryTool implements ICopilotTool<MemoryToolParams> {
 		const scope: MemoryScope = isSessionPath(path) ? 'session' : 'user';
 		const result = await this._dispatchLocal(params, scope, sessionResource);
 		this._sendLocalTelemetry(params.command, scope, result.outcome, requestId, model);
+
+		// Sync user memories to CAPI if enabled (mirrors repo sync pattern)
+		if (scope === 'user' && params.command === 'create' && result.outcome === 'success') {
+			const capiEnabled = this.configurationService.getExperimentBasedConfig(ConfigKey.CopilotMemoryEnabled, this.experimentationService);
+			if (capiEnabled) {
+				await this._syncUserMemoryCAPI(params);
+			}
+		}
+
 		return result.text;
 	}
 
@@ -309,36 +319,73 @@ export class MemoryTool implements ICopilotTool<MemoryToolParams> {
 
 			// Parse the file_text as a memory entry.
 			// Accept either a JSON-formatted entry or a plain text fact.
-			let entry: RepoMemoryEntry;
+			let entry: StoreMemoryRequest;
 			try {
 				const parsed = JSON.parse(params.file_text);
+				const rawCitations = parsed.citations;
+				const citations: string[] = Array.isArray(rawCitations)
+					? rawCitations
+					: typeof rawCitations === 'string' && rawCitations.length > 0
+						? rawCitations.split(',').map((c: string) => c.trim()).filter((c: string) => c.length > 0)
+						: [];
 				entry = {
 					subject: parsed.subject || pathHint,
 					fact: parsed.fact || '',
-					citations: parsed.citations || '',
+					citations,
 					reason: parsed.reason || '',
-					category: parsed.category || pathHint,
 				};
 			} catch {
 				// Plain text: treat the whole content as a fact, use path as subject
 				entry = {
 					subject: pathHint,
 					fact: params.file_text,
-					citations: '',
+					citations: [],
 					reason: 'Stored from memory tool create command.',
-					category: pathHint,
 				};
 			}
 
 			const success = await this.agentMemoryService.storeRepoMemory(entry);
 			if (success) {
-				return { text: `File created successfully at: ${params.path}`, outcome: 'success' };
+				return { text: 'Repository memory stored successfully.', outcome: 'success' };
 			} else {
 				return { text: 'Error: Failed to store repository memory entry.', outcome: 'error' };
 			}
 		} catch (error) {
 			this.logService.error('[MemoryTool] Error creating repo memory:', error);
-			return { text: `Error: Cannot create repository memory: ${error.message}`, outcome: 'error' };
+			return { text: `Error: Cannot create repository memory: ${error instanceof Error ? error.message : String(error)}`, outcome: 'error' };
+		}
+	}
+
+	private async _syncUserMemoryCAPI(params: ICreateParams): Promise<void> {
+		try {
+			const filename = params.path.split('/').pop() || 'memory';
+			const pathHint = filename.replace(/\.\w+$/, '');
+			let entry: StoreMemoryRequest;
+			try {
+				const parsed = JSON.parse(params.file_text);
+				const rawCitations = parsed.citations;
+				const citations: string[] = Array.isArray(rawCitations)
+					? rawCitations
+					: typeof rawCitations === 'string' && rawCitations.length > 0
+						? rawCitations.split(',').map((c: string) => c.trim()).filter((c: string) => c.length > 0)
+						: [];
+				entry = {
+					subject: parsed.subject || pathHint,
+					fact: parsed.fact || '',
+					citations,
+					reason: parsed.reason || '',
+				};
+			} catch {
+				entry = {
+					subject: pathHint,
+					fact: params.file_text,
+					citations: [],
+					reason: 'Stored from memory tool create command.',
+				};
+			}
+			await this.agentMemoryService.storeUserMemory(entry);
+		} catch (error) {
+			this.logService.warn(`[MemoryTool] Failed to sync user memory to CAPI: ${error}`);
 		}
 	}
 
@@ -434,7 +481,7 @@ export class MemoryTool implements ICopilotTool<MemoryToolParams> {
 			}
 		} catch (error) {
 			this.logService.error('[MemoryTool] Local operation error:', error);
-			return { text: `Error: ${error.message}`, outcome: 'error' };
+			return { text: `Error: ${error instanceof Error ? error.message : String(error)}`, outcome: 'error' };
 		}
 	}
 
