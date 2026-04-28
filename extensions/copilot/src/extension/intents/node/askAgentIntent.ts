@@ -5,6 +5,7 @@
 
 import type * as vscode from 'vscode';
 import { ChatLocation } from '../../../platform/chat/common/commonTypes';
+import { ISessionTranscriptService } from '../../../platform/chat/common/sessionTranscriptService';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
 import { IAutomodeService } from '../../../platform/endpoint/node/automodeService';
@@ -31,6 +32,7 @@ import { IIntent, IIntentInvocationContext, IntentLinkificationOptions } from '.
 import { AgentPrompt } from '../../prompts/node/agent/agentPrompt';
 import { ICodeMapperService } from '../../prompts/node/codeMapper/codeMapperService';
 import { IToolsService } from '../../tools/common/toolsService';
+import { IAgentMemoryCachePrimer } from '../../tools/node/agentMemoryCachePrimer';
 import { getAgentMaxRequests } from '../common/agentConfig';
 import { AgentIntentInvocation } from './agentIntent';
 
@@ -128,8 +130,10 @@ export class AskAgentIntentInvocation extends AgentIntentInvocation {
 		@IExperimentationService expService: IExperimentationService,
 		@IAutomodeService automodeService: IAutomodeService,
 		@IOTelService otelService: IOTelService,
+		@IAgentMemoryCachePrimer agentMemoryCachePrimer: IAgentMemoryCachePrimer,
+		@ISessionTranscriptService sessionTranscriptService: ISessionTranscriptService,
 	) {
-		super(intent, location, endpoint, request, { processCodeblocks: true }, instantiationService, codeMapperService, envService, promptPathRepresentationService, endpointProvider, workspaceService, toolsService, configurationService, editLogService, commandService, telemetryService, notebookService, logService, expService, automodeService, otelService);
+		super(intent, location, endpoint, request, { processCodeblocks: true }, instantiationService, codeMapperService, envService, promptPathRepresentationService, endpointProvider, workspaceService, toolsService, configurationService, editLogService, commandService, telemetryService, notebookService, logService, expService, automodeService, otelService, agentMemoryCachePrimer, sessionTranscriptService);
 	}
 
 	public override async getAvailableTools(): Promise<vscode.LanguageModelToolInformation[]> {

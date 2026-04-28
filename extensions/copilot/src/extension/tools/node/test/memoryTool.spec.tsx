@@ -3,10 +3,11 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { afterAll, beforeAll, beforeEach, describe, expect, suite, test } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, suite, test, vi } from 'vitest';
 import { IVSCodeExtensionContext } from '../../../../platform/extContext/common/extensionContext';
 import { IFileSystemService } from '../../../../platform/filesystem/common/fileSystemService';
 import { MockFileSystemService } from '../../../../platform/filesystem/node/test/mockFileSystemService';
+import { IConfigurationService } from '../../../../platform/configuration/common/configurationService';
 import { NullTelemetryService } from '../../../../platform/telemetry/common/nullTelemetryService';
 import { ITelemetryService, TelemetryEventMeasurements, TelemetryEventProperties } from '../../../../platform/telemetry/common/telemetry';
 import { MockExtensionContext } from '../../../../platform/test/node/extensionContext';
@@ -16,8 +17,9 @@ import { URI } from '../../../../util/vs/base/common/uri';
 import { SyncDescriptor } from '../../../../util/vs/platform/instantiation/common/descriptors';
 import { IInstantiationService } from '../../../../util/vs/platform/instantiation/common/instantiation';
 import { MarkdownString } from '../../../../vscodeTypes';
+import type { MemoryPromptResponse, StoreMemoryRequest } from '@github/copilot-agentic-tools/memory';
+import { IAgentMemoryService } from '../../common/agentMemoryService';
 import { createExtensionUnitTestingServices } from '../../../test/node/services';
-import { IAgentMemoryService, RepoMemoryEntry } from '../../common/agentMemoryService';
 import { MemoryTool } from '../memoryTool';
 
 /**
@@ -44,23 +46,34 @@ class MockCapturingTelemetryService extends NullTelemetryService {
  */
 class MockAgentMemoryService implements IAgentMemoryService {
 	declare readonly _serviceBrand: undefined;
-	storedMemories: RepoMemoryEntry[] = [];
+	storedMemories: StoreMemoryRequest[] = [];
+	storedUserMemories: StoreMemoryRequest[] = [];
 
-	async checkMemoryEnabled(): Promise<boolean> {
+	async storeRepoMemory(memory: StoreMemoryRequest): Promise<boolean> {
+		this.storedMemories.push({ ...memory, citations: memory.citations ?? [] });
 		return true;
 	}
 
-	async getRepoMemories(_limit?: number): Promise<RepoMemoryEntry[] | undefined> {
-		return this.storedMemories;
+	async storeUserMemory(memory: StoreMemoryRequest): Promise<boolean> {
+		this.storedUserMemories.push(memory);
+		return true;
 	}
 
-	async storeRepoMemory(memory: RepoMemoryEntry): Promise<boolean> {
-		this.storedMemories.push(memory);
-		return true;
+	async getMemoryPrompt(_repoNwo?: string, _sessionId?: string): Promise<MemoryPromptResponse | undefined> {
+		return undefined;
+	}
+
+	getCachedMemoryPrompt(_sessionId?: string): MemoryPromptResponse | undefined {
+		return undefined;
+	}
+
+	clearCache(_sessionId?: string): void {
+		// Mock implementation - no-op
 	}
 
 	clearMemories(): void {
 		this.storedMemories = [];
+		this.storedUserMemories = [];
 	}
 }
 
@@ -70,16 +83,24 @@ class MockAgentMemoryService implements IAgentMemoryService {
 class DisabledMockAgentMemoryService implements IAgentMemoryService {
 	declare readonly _serviceBrand: undefined;
 
-	async checkMemoryEnabled(): Promise<boolean> {
+	async storeRepoMemory(_memory: StoreMemoryRequest): Promise<boolean> {
 		return false;
 	}
 
-	async getRepoMemories(_limit?: number): Promise<RepoMemoryEntry[] | undefined> {
+	async storeUserMemory(_memory: StoreMemoryRequest): Promise<boolean> {
+		return false;
+	}
+
+	async getMemoryPrompt(_repoNwo?: string, _sessionId?: string): Promise<MemoryPromptResponse | undefined> {
 		return undefined;
 	}
 
-	async storeRepoMemory(_memory: RepoMemoryEntry): Promise<boolean> {
-		return false;
+	getCachedMemoryPrompt(_sessionId?: string): MemoryPromptResponse | undefined {
+		return undefined;
+	}
+
+	clearCache(_sessionId?: string): void {
+		// Mock implementation - no-op
 	}
 }
 
@@ -448,6 +469,14 @@ suite('MemoryTool', () => {
 	// --- Repo path routing ---
 
 	describe('repo path operations', () => {
+		beforeEach(() => {
+			vi.spyOn(accessor.get(IConfigurationService), 'getExperimentBasedConfig').mockReturnValue(true);
+		});
+
+		afterEach(() => {
+			vi.restoreAllMocks();
+		});
+
 		test('view is not supported for repo paths', async () => {
 			const result = await invokeMemoryTool(tool, {
 				command: 'view',
@@ -470,7 +499,60 @@ suite('MemoryTool', () => {
 				}),
 			});
 			const text = getResultText(result as never);
-			expect(text).toContain('File created successfully');
+			expect(text).toContain('Repository memory stored successfully.');
+		});
+	});
+
+	// --- User CAPI sync ---
+
+	describe('user memory CAPI sync', () => {
+		beforeEach(() => {
+			vi.spyOn(accessor.get(IConfigurationService), 'getExperimentBasedConfig').mockReturnValue(true);
+		});
+
+		afterEach(() => {
+			vi.restoreAllMocks();
+		});
+
+		test('syncs JSON-formatted user create to CAPI with parsed fields', async () => {
+			await invokeMemoryTool(tool, {
+				command: 'create',
+				path: '/memories/patterns.json',
+				file_text: JSON.stringify({
+					subject: 'prefer arrow functions',
+					fact: 'use arrow functions over function expressions',
+					citations: 'src/foo.ts:10,src/bar.ts:20',
+					reason: 'codebase convention',
+				}),
+			});
+			expect(mockMemoryService.storedUserMemories).toHaveLength(1);
+			const synced = mockMemoryService.storedUserMemories[0];
+			expect(synced.subject).toBe('prefer arrow functions');
+			expect(synced.fact).toBe('use arrow functions over function expressions');
+			expect(synced.citations).toEqual(['src/foo.ts:10', 'src/bar.ts:20']);
+			expect(synced.reason).toBe('codebase convention');
+		});
+
+		test('syncs plain-text user create to CAPI using filename as subject', async () => {
+			await invokeMemoryTool(tool, {
+				command: 'create',
+				path: '/memories/debugging.md',
+				file_text: 'always check the logs first',
+			});
+			expect(mockMemoryService.storedUserMemories).toHaveLength(1);
+			const synced = mockMemoryService.storedUserMemories[0];
+			expect(synced.subject).toBe('debugging');
+			expect(synced.fact).toBe('always check the logs first');
+			expect(synced.citations).toEqual([]);
+		});
+
+		test('does not sync session-scoped creates to CAPI', async () => {
+			await invokeMemoryTool(tool, {
+				command: 'create',
+				path: '/memories/session/temp.md',
+				file_text: 'temp note',
+			});
+			expect(mockMemoryService.storedUserMemories).toHaveLength(0);
 		});
 	});
 
@@ -599,30 +681,40 @@ suite('MemoryTool', () => {
 		});
 
 		test('emits memoryRepoToolInvoked for repo create', async () => {
-			await invokeMemoryTool(tool, {
-				command: 'create',
-				path: '/memories/repo/fact.json',
-				file_text: JSON.stringify({ subject: 'test', fact: 'fact' }),
-			});
-			const events = mockTelemetry.getEvents('memoryRepoToolInvoked');
-			expect(events.length).toBe(1);
-			expect(events[0].properties).toMatchObject({
-				command: 'create',
-				toolOutcome: 'success',
-			});
+			vi.spyOn(accessor.get(IConfigurationService), 'getExperimentBasedConfig').mockReturnValue(true);
+			try {
+				await invokeMemoryTool(tool, {
+					command: 'create',
+					path: '/memories/repo/fact.json',
+					file_text: JSON.stringify({ subject: 'test', fact: 'fact' }),
+				});
+				const events = mockTelemetry.getEvents('memoryRepoToolInvoked');
+				expect(events.length).toBe(1);
+				expect(events[0].properties).toMatchObject({
+					command: 'create',
+					toolOutcome: 'success',
+				});
+			} finally {
+				vi.restoreAllMocks();
+			}
 		});
 
 		test('emits memoryRepoToolInvoked with error for unsupported command', async () => {
-			await invokeMemoryTool(tool, {
-				command: 'view',
-				path: '/memories/repo',
-			});
-			const events = mockTelemetry.getEvents('memoryRepoToolInvoked');
-			expect(events.length).toBe(1);
-			expect(events[0].properties).toMatchObject({
-				command: 'view',
-				toolOutcome: 'error',
-			});
+			vi.spyOn(accessor.get(IConfigurationService), 'getExperimentBasedConfig').mockReturnValue(true);
+			try {
+				await invokeMemoryTool(tool, {
+					command: 'view',
+					path: '/memories/repo',
+				});
+				const events = mockTelemetry.getEvents('memoryRepoToolInvoked');
+				expect(events.length).toBe(1);
+				expect(events[0].properties).toMatchObject({
+					command: 'view',
+					toolOutcome: 'error',
+				});
+			} finally {
+				vi.restoreAllMocks();
+			}
 		});
 
 		test('emits memoryToolInvoked with repo scope when CAPI memory disabled (local fallback)', async () => {
